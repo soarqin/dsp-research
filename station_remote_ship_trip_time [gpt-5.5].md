@@ -126,7 +126,7 @@ speed(w) = shipSailSpeed + warpAdd(w)
 `warpState` 的变化是分段的：
 
 - 远离目标时，每 tick 增加 `1 / 60`，也就是约 1 秒从 0 增至 1。
-- 进入刹车区时，每 tick 减少 `1 / 15`，也就是约 0.25 秒从 1 降至 0。
+- 进入刹车区时，单次触发会减少 `1 / 15`。但该条件每 tick 会重新按新的 `warpState` 计算，不保证连续 15 帧降到 0。
 - 刹车区按当前曲速附加速度动态计算：
 
 ```text
@@ -140,11 +140,56 @@ S_up(w0, w1) = (s - W / 1000) * (w1 - w0)
              + W / (1000 * ln(1001)) * (1001^w1 - 1001^w0)
 ```
 
-曲速降速段每秒减少约 4，因此距离为：
+若强行假设降速条件连续成立，曲速降速段每秒减少约 4，距离为：
 
 ```text
 S_down(w1 -> w0) = S_up(w0, w1) / 4
 ```
+
+这个公式只是理想连续近似。实际代码中，`brakeDistance(w)` 会随 `warpState` 下降而明显变小，下一帧可能重新进入 `warpState += 1 / 60` 分支，因此不能把真实曲速降速阶段固定看作 15 tick。
+
+### 曲速减速阈值振荡
+
+`InternalTickRemote` 的曲速减速判断是一个离散阈值控制：
+
+```text
+brakeDistance(w) = warpAdd(w) * 0.0449 + 5000 + shipSailSpeed * 0.25
+
+if distanceToDock < brakeDistance(w):
+    w -= 1 / 15
+else:
+    w += 1 / 60
+```
+
+当 `distanceToDock < brakeDistance(w)` 刚触发时，代码先按旧 `w` 计算 `num29 = distanceToDock - brakeDistance(w)`，然后把负值钳制到 0。随后即使新的 `w` 仍大于 0，曲速附加速度也会被 `num29` 钳制为 0：
+
+```text
+if warpAdd(newW) / 60 > num29:
+    warpAdd(newW) = num29 * 60 * 1.01
+```
+
+因此该 tick 通常只按航行速度前进。但因为 `w` 下降后 `brakeDistance(w)` 也下降，下一 tick 很容易出现：
+
+```text
+distanceToDock_next > brakeDistance(newW)
+```
+
+此时分支会重新变成 `w += 1 / 60`。这不是异常，而是游戏代码实际形成的锯齿状阈值跟踪。
+
+翻转的近似条件为：
+
+```text
+brakeDistance(w) - brakeDistance(w - 1 / 15) > shipSailSpeed / 60
+```
+
+在常见参数下该条件很容易满足。例如 `shipSailSpeed = 400`、`W = 400000`、`w = 1` 时，`brakeDistance` 单 tick 下降约 6600，而航行速度单 tick 只前进约 6.7。简化一维模型从满 `warpState` 刚进入刹车边界开始，到 `warpState = 0` 约需要 39 tick，而不是 15 tick。
+
+处理方式如下：
+
+- 不要把实际曲速降速阶段写成固定 `0.25` 秒或固定 15 tick。
+- 若允许极少量离散计算，建议只在曲速刹车区按上述 `distanceToDock` / `brakeDistance(w)` 递推。刹车区通常只有几十 tick，计算量可以忽略，且比整程逐帧模拟小得多。
+- 若必须保持 O(1) 闭式估算，应把 `S_down = S_up / 4` 标为下界或理想近似，并给它增加经验余量。默认星际物流运输船速度下，可以把满 `warpState` 刹车段按 35 到 45 tick 估算，而不是 15 tick。
+- 若目标是复刻游戏 UI，优先按 `CalcArrivalRemainingTime` 的经验式处理；它同样不是严格模拟，但它是游戏显示 ETA 使用的估算口径。
 
 这些公式只描述速度包络，不描述姿态导引和天体避障。
 
@@ -237,7 +282,7 @@ warpAdd(w) = W * (1001^w - 1) / 1000
 brakeDistance(w) = warpAdd(w) * 0.0449 + 5000 + s * 0.25
 S_up(w0, w1) = (s - W / 1000) * (w1 - w0)
              + W / (1000 * ln(1001)) * (1001^w1 - 1001^w0)
-S_down(w1, w0) = S_up(w0, w1) / 4
+S_down_ideal(w1, w0) = S_up(w0, w1) / 4
 ```
 
 实用算法：
@@ -248,11 +293,11 @@ S_down(w1, w0) = S_up(w0, w1) / 4
 3. 若剩余距离小于 B + S_up(max(w0, 0), 1)，不强行估算短距离曲速，返回普通航行结果。
 4. 曲速升至满状态：T += 1 - max(w0, 0)，距离扣除 S_up(max(w0, 0), 1)。
 5. 满曲速巡航：T += (D_remaining - B) / (s + W)，距离扣到 B。
-6. 曲速降速：T += 0.25，距离扣除 S_down(1, 0)。
+6. 曲速降速：不要固定写成 0.25 秒。优先用曲速刹车区的短递推；若必须 O(1)，用经验值或下界加余量。
 7. 剩余距离用普通航行近距离公式收尾。
 ```
 
-短距离刚好进入曲速但达不到满 `warpState = 1` 时，可以解方程 `S_up(w0, wPeak) = availableDistance` 得到 `wPeak`。这个方程单调，牛顿迭代 2 到 4 次即可，仍然不是逐帧模拟。若追求公式简单，可以直接放弃这段短曲速并按普通航行估算；影响通常小于几秒，因为曲速启动和降速总时长只有约 1.25 秒，但在非常短的跨星球航线中会偏慢。
+短距离刚好进入曲速但达不到满 `warpState = 1` 时，可以解方程 `S_up(w0, wPeak) = availableDistance` 得到 `wPeak`。这个方程单调，牛顿迭代 2 到 4 次即可，仍然不是逐帧模拟。若追求公式简单，可以直接放弃这段短曲速并按普通航行估算；影响通常小于几秒，但在非常短的跨星球航线中会偏慢。
 
 ### 步骤 5：加入入坞或收尾动画
 
@@ -383,7 +428,7 @@ timeTicks ≈ 6400 / (79 + 1 / x)
 
 对「尚未出发的一整段路线预估」而言，`CalcRemoteSingleTripTime` 通常也比本文快速方法更准。它使用真实塔位、真实星球坐标和方向相关的近起点加速模型，并包含起飞、入坞、停站动画时间。
 
-本文方法的优势是输入少、计算式清晰、适合批量外部估算。它的曲速积分部分如果使用 `S_up` 和 `S_down` 的指数闭式公式，在速度包络上比游戏函数的 `80 ticks + 0.18775714286 * W` 经验近似更贴近 `InternalTickRemote` 的 `warpAdd(w)` 定义；但整体 ETA 仍会因为缺少姿态、阶段和天体状态而不如 `CalcArrivalRemainingTime` 稳定。
+本文方法的优势是输入少、计算式清晰、适合批量外部估算。它的曲速升速部分如果使用 `S_up` 的指数闭式公式，在速度包络上比游戏函数的 `80 ticks + 0.18775714286 * W` 经验近似更贴近 `InternalTickRemote` 的 `warpAdd(w)` 定义；曲速降速部分则需要按阈值跟踪做短递推，不能直接套用 `S_down_ideal`。整体 ETA 仍会因为缺少姿态、阶段和天体状态而不如 `CalcArrivalRemainingTime` 稳定。
 
 最终建议如下：
 
