@@ -303,3 +303,46 @@ S_down(w0,w1) = 1/4 * [ (v_s - warp_cap/1000) * (w0-w1)
 3. 本文算法比 `CalcRemoteSingleTripTime` 更适合「半路上的飞船」，因为 `CalcRemoteSingleTripTime` 只估完整单程，不能表达当前速度和当前 `warpState`；但如果飞船尚未出发，`CalcRemoteSingleTripTime` 更贴近游戏内部常数和分支。
 
 因此，若运行环境能访问游戏对象，应优先调用或复刻 `CalcArrivalRemainingTime`。若只能使用题目给定的少量标量输入，本文闭式算法是更可移植的近似方案，但不会比游戏内 `CalcArrivalRemainingTime` 更准。
+
+## 曲速退出阶段的 `warpState` 抖动
+
+需要注意，曲速退出阶段不能简单认为「`warpState` 每 tick 减少 `1/15`，所以最多 `15 * warpState` tick 后退出」。
+
+相关逻辑为：
+
+```text
+warp_extra(w) = warp_cap * (1001^w - 1) / 1000
+safe_exit(w) = 0.0449 * warp_extra(w) + 5000 + 0.25 * v_s
+
+if d_target < safe_exit(w):
+    warpState -= 1/15
+else:
+    warpState += 1/60
+```
+
+`safe_exit(w)` 随 `warpState` 单调增加，而且因为包含 `1001^w`，高 `warpState` 区间变化很陡。于是确实可能出现以下过程：
+
+1. 当前帧 `d_target < safe_exit(w)`，进入退出逻辑，`warpState` 降低 `1/15`。
+2. 下一帧因为 `warpState` 变小，`safe_exit(w)` 明显降低。
+3. 如果 `d_target` 还没有同步降低到新的安全距离以下，就会变成 `d_target >= safe_exit(w)`，代码转而让 `warpState` 增加 `1/60`。
+
+因此，退出曲速不是严格单调下降，而是一个围绕 `d_target ≈ safe_exit(w)` 的离散控制过程。它可能出现下降、上升交替的抖动，实际耗时可能大于 `15 * warpState` tick。
+
+还有一个细节会放大这个现象：当本帧已经满足 `d_target < safe_exit(w)` 时，代码会把 `num29 = d_target - safe_exit(w)` 截断为 0；随后重算曲速附加速度时，如果 `warp_extra / 60 > num29`，会把 `warp_extra` 限到接近 0。因此这一帧虽然降低了 `warpState`，但位移几乎只按非曲速速度推进。下一帧更容易因为安全距离降低而重新进入 `warpState += 1/60` 分支。
+
+### 闭式估算中的处理建议
+
+如果目标是快速估算，不建议把曲速退出写死为 `ceil(15 * warpState)` tick。更稳妥的处理有三种：
+
+1. **使用游戏内近似**：`CalcArrivalRemainingTime` 在接近退出区间时没有使用 `15 * warpState`，而是使用类似 `warpState * 20` 的估计。这相当于给抖动和离散控制留出约 1/3 的余量。对于不逐 tick 模拟的实现，这是最简单的修正。
+2. **事件级计算**：保留 `safe_exit(w)`，按 `d_target` 与 `safe_exit(w)` 的交点求目标 `warpState`，但每次跨越时按 `-1/15` 和 `+1/60` 的离散步长推进到下一个事件。这不是完整运动模拟，不需要更新姿态和避障，但会比纯闭式复杂。
+3. **保守估算**：如果只需要剩余时间不要低估，可把曲速退出耗时取为 `ceil(20 * warpState)` tick，或者在远距离曲速剩余时间上额外加 `ceil(5 * warpState)` tick 的安全余量。
+
+本文推荐算法中原先写的「曲速下降时间约 `warp_state / 4` 秒」只适用于忽略抖动的理想情况。更实用的版本应改为：
+
+```text
+warp_exit_ticks ≈ ceil(20 * warp_state)
+warp_exit_seconds ≈ warp_exit_ticks / 60
+```
+
+如果追求与游戏内估算函数一致，应优先采用 `CalcArrivalRemainingTime` 对曲速退出区间的分支，而不是固定 15 tick 的单调下降模型。
